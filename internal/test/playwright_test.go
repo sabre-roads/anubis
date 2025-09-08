@@ -38,6 +38,7 @@ var (
 	playwrightServer      = flag.String("playwright", "ws://localhost:9001", "Playwright server URL")
 	playwrightMaxTime     = flag.Duration("playwright-max-time", 5*time.Second, "maximum time for Playwright requests")
 	playwrightMaxHardTime = flag.Duration("playwright-max-hard-time", 5*time.Minute, "maximum time for hard Playwright requests")
+	playwrightRunner      = flag.String("playwright-runner", "npx", "how to start Playwright, can be: none,npx,docker,podman")
 
 	testCases = []testCase{
 		{
@@ -51,6 +52,24 @@ var (
 			action:    actionDeny,
 			realIP:    placeholderIP,
 			userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.6099.28 Safari/537.36",
+		},
+		{
+			name:      "Amazonbot",
+			action:    actionDeny,
+			realIP:    placeholderIP,
+			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/600.2.5 (KHTML, like Gecko) Version/8.0.2 Safari/600.2.5 (Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+		},
+		{
+			name:      "Amazonbot",
+			action:    actionDeny,
+			realIP:    placeholderIP,
+			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/600.2.5 (KHTML, like Gecko) Version/8.0.2 Safari/600.2.5 (Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+		},
+		{
+			name:      "PerplexityAI",
+			action:    actionDeny,
+			realIP:    placeholderIP,
+			userAgent: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)",
 		},
 		{
 			name:      "kagiBadIP",
@@ -80,27 +99,31 @@ const (
 	actionChallenge action = "CHALLENGE"
 
 	placeholderIP     = "fd11:5ee:bad:c0de::"
-	playwrightVersion = "1.50.1"
+	playwrightVersion = "1.52.0"
 )
 
 type action string
 
 type testCase struct {
-	name              string
-	action            action
-	isHard            bool
-	realIP, userAgent string
+	name      string
+	action    action
+	realIP    string
+	userAgent string
+	isHard    bool
 }
 
-func doesNPXExist(t *testing.T) {
+func doesCommandExist(t *testing.T, command string) {
 	t.Helper()
 
-	if _, err := exec.LookPath("npx"); err != nil {
-		t.Skipf("npx not found in PATH, skipping integration smoke testing: %v", err)
+	if _, err := exec.LookPath(command); err != nil {
+		t.Skipf("%s not found in PATH, skipping integration smoke testing: %v", command, err)
 	}
 }
 
 func run(t *testing.T, command string) string {
+	if testing.Short() {
+		t.Skip("skipping integration smoke testing in short mode")
+	}
 	t.Helper()
 
 	shPath, err := exec.LookPath("sh")
@@ -148,13 +171,30 @@ func daemonize(t *testing.T, command string) {
 func startPlaywright(t *testing.T) {
 	t.Helper()
 
-	if os.Getenv("CI") == "true" {
-		run(t, fmt.Sprintf("npx --yes playwright@%s install --with-deps", playwrightVersion))
-	} else {
-		run(t, fmt.Sprintf("npx --yes playwright@%s install", playwrightVersion))
-	}
+	if *playwrightRunner == "npx" {
+		doesCommandExist(t, "npx")
 
-	daemonize(t, fmt.Sprintf("npx --yes playwright@%s run-server --port %d", playwrightVersion, *playwrightPort))
+		if os.Getenv("CI") == "true" {
+			run(t, fmt.Sprintf("npx --yes playwright@%s install --with-deps", playwrightVersion))
+		} else {
+			run(t, fmt.Sprintf("npx --yes playwright@%s install", playwrightVersion))
+		}
+
+		daemonize(t, fmt.Sprintf("npx --yes playwright@%s run-server --port %d", playwrightVersion, *playwrightPort))
+	} else if *playwrightRunner == "docker" || *playwrightRunner == "podman" {
+		doesCommandExist(t, *playwrightRunner)
+
+		// docs: https://playwright.dev/docs/docker
+		pwcmd := fmt.Sprintf("npx -y playwright@%s run-server --port %d --host 0.0.0.0", playwrightVersion, *playwrightPort)
+		container := run(t, fmt.Sprintf("%s run -d --ipc=host --user pwuser --workdir /home/pwuser --net=host mcr.microsoft.com/playwright:v%s-noble /bin/sh -c \"%s\"", *playwrightRunner, playwrightVersion, pwcmd))
+		t.Cleanup(func() {
+			run(t, fmt.Sprintf("%s rm --force %s", *playwrightRunner, container))
+		})
+	} else if *playwrightRunner == "none" {
+		t.Log("not starting Playwright, assuming it is already running")
+	} else {
+		t.Skipf("unknown runner: %s, skipping", *playwrightRunner)
+	}
 
 	for {
 		if _, err := http.Get(fmt.Sprintf("http://localhost:%d", *playwrightPort)); err != nil {
@@ -174,7 +214,11 @@ func TestPlaywrightBrowser(t *testing.T) {
 		return
 	}
 
-	doesNPXExist(t)
+	if os.Getenv("SKIP_INTEGRATION") != "" {
+		t.Skip("SKIP_INTEGRATION was set")
+		return
+	}
+
 	startPlaywright(t)
 
 	pw := setupPlaywright(t)
@@ -241,6 +285,136 @@ func TestPlaywrightBrowser(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestPlaywrightWithBasePrefix(t *testing.T) {
+	if os.Getenv("DONT_USE_NETWORK") != "" {
+		t.Skip("test requires network egress")
+		return
+	}
+
+	if os.Getenv("SKIP_INTEGRATION") != "" {
+		t.Skip("SKIP_INTEGRATION was set")
+		return
+	}
+
+	t.Skip("NOTE(Xe)\\ these tests require HTTPS support in #364")
+
+	startPlaywright(t)
+
+	pw := setupPlaywright(t)
+	basePrefix := "/myapp"
+	anubisURL := spawnAnubisWithOptions(t, basePrefix)
+
+	// Reset BasePrefix after test
+	t.Cleanup(func() {
+		anubis.BasePrefix = ""
+	})
+
+	browsers := []playwright.BrowserType{pw.Chromium}
+
+	for _, typ := range browsers {
+		t.Run(typ.Name()+"/basePrefix", func(t *testing.T) {
+			browser, err := typ.Connect(buildBrowserConnect(typ.Name()), playwright.BrowserTypeConnectOptions{
+				ExposeNetwork: playwright.String("<loopback>"),
+			})
+			if err != nil {
+				t.Fatalf("could not connect to remote browser: %v", err)
+			}
+			defer browser.Close()
+
+			ctx, err := browser.NewContext(playwright.BrowserNewContextOptions{
+				AcceptDownloads: playwright.Bool(false),
+				ExtraHttpHeaders: map[string]string{
+					"X-Real-Ip": "127.0.0.1",
+				},
+				UserAgent: playwright.String("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0"),
+			})
+			if err != nil {
+				t.Fatalf("could not create context: %v", err)
+			}
+			defer ctx.Close()
+
+			page, err := ctx.NewPage()
+			if err != nil {
+				t.Fatalf("could not create page: %v", err)
+			}
+			defer page.Close()
+
+			// Test accessing the base URL with prefix
+			_, err = page.Goto(anubisURL+basePrefix, playwright.PageGotoOptions{
+				Timeout: pwTimeout(testCases[0], time.Now().Add(5*time.Second)),
+			})
+			if err != nil {
+				pwFail(t, page, "could not navigate to test server with base prefix: %v", err)
+			}
+
+			// Check if challenge page is displayed
+			image := page.Locator("#image[src*=pensive], #image[src*=happy]")
+			err = image.WaitFor(playwright.LocatorWaitForOptions{
+				Timeout: pwTimeout(testCases[0], time.Now().Add(5*time.Second)),
+			})
+			if err != nil {
+				pwFail(t, page, "could not wait for challenge image: %v", err)
+			}
+
+			isVisible, err := image.IsVisible()
+			if err != nil {
+				pwFail(t, page, "could not check if challenge image is visible: %v", err)
+			}
+			if !isVisible {
+				pwFail(t, page, "challenge image not visible")
+			}
+
+			// Complete the challenge
+			// Wait for the challenge to be solved
+			anubisTest := page.Locator("#anubis-test")
+			err = anubisTest.WaitFor(playwright.LocatorWaitForOptions{
+				Timeout: pwTimeout(testCases[0], time.Now().Add(30*time.Second)),
+			})
+			if err != nil {
+				pwFail(t, page, "could not wait for challenge to be solved: %v", err)
+			}
+
+			// Verify the challenge was solved
+			content, err := anubisTest.TextContent(playwright.LocatorTextContentOptions{})
+			if err != nil {
+				pwFail(t, page, "could not get text content: %v", err)
+			}
+
+			var tm int64
+			if _, err := fmt.Sscanf(content, "%d", &tm); err != nil {
+				pwFail(t, page, "unexpected output: %s", content)
+			}
+
+			// Check if the timestamp is reasonable
+			now := time.Now().Unix()
+			if tm < now-60 || tm > now+60 {
+				pwFail(t, page, "unexpected timestamp in output: %d not in range %d±60", tm, now)
+			}
+
+			// Check if cookie has the correct path
+			cookies, err := ctx.Cookies()
+			if err != nil {
+				pwFail(t, page, "could not get cookies: %v", err)
+			}
+
+			var found bool
+			for _, cookie := range cookies {
+				if cookie.Name == anubis.CookieName {
+					found = true
+					if cookie.Path != basePrefix+"/" {
+						t.Errorf("cookie path is wrong, wanted %s, got: %s", basePrefix+"/", cookie.Path)
+					}
+					break
+				}
+			}
+
+			if !found {
+				t.Errorf("Cookie %q not found", anubis.CookieName)
+			}
+		})
 	}
 }
 
@@ -357,14 +531,14 @@ func pwFail(t *testing.T, page playwright.Page, format string, args ...any) erro
 }
 
 func pwTimeout(tc testCase, deadline time.Time) *float64 {
-	max := *playwrightMaxTime
+	maxTime := *playwrightMaxTime
 	if tc.isHard {
-		max = *playwrightMaxHardTime
+		maxTime = *playwrightMaxHardTime
 	}
 
 	d := time.Until(deadline)
-	if d <= 0 || d > max {
-		return playwright.Float(float64(max.Milliseconds()))
+	if d <= 0 || d > maxTime {
+		return playwright.Float(float64(maxTime.Milliseconds()))
 	}
 	return playwright.Float(float64(d.Milliseconds()))
 }
@@ -410,6 +584,10 @@ func setupPlaywright(t *testing.T) *playwright.Playwright {
 }
 
 func spawnAnubis(t *testing.T) string {
+	return spawnAnubisWithOptions(t, "")
+}
+
+func spawnAnubisWithOptions(t *testing.T, basePrefix string) string {
 	t.Helper()
 
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -417,7 +595,7 @@ func spawnAnubis(t *testing.T) string {
 		fmt.Fprintf(w, "<html><body><span id=anubis-test>%d</span></body></html>", time.Now().Unix())
 	})
 
-	policy, err := libanubis.LoadPoliciesOrDefault("", anubis.DefaultDifficulty)
+	policy, err := libanubis.LoadPoliciesOrDefault(t.Context(), "", anubis.DefaultDifficulty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +614,7 @@ func spawnAnubis(t *testing.T) string {
 		Policy:         policy,
 		ServeRobotsTXT: true,
 		Target:         "http://" + host + ":" + port,
+		BasePrefix:     basePrefix,
 	})
 	if err != nil {
 		t.Fatalf("can't construct libanubis.Server: %v", err)

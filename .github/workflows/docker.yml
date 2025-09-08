@@ -3,8 +3,8 @@ name: Docker image builds
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
-    tags: [ "v*" ]
+    branches: ["main"]
+    tags: ["v*"]
 
 env:
   DOCKER_METADATA_SET_OUTPUT_ENV: "true"
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -27,8 +27,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set lowercase image name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@master
+        uses: Homebrew/actions/setup-homebrew@main
 
       - name: Setup Homebrew cellar cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -51,18 +55,18 @@ jobs:
         run: |
           brew bundle
 
-      - name: Log into registry 
+      - name: Log into registry
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
-          username: sabre-roads
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
-          images: ghcr.io/sabre-roads/anubis
+          images: ${{ env.IMAGE }}
 
       - name: Build and push
         id: build
@@ -70,12 +74,12 @@ jobs:
           npm ci
           npm run container
         env:
-          DOCKER_REPO: ghcr.io/sabre-roads/anubis
+          DOCKER_REPO: ${{ env.IMAGE }}
           SLOG_LEVEL: debug
-      
+
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ghcr.io/sabre-roads/anubis
+          subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true

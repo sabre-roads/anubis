@@ -1,563 +1,616 @@
 package lib
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"log"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
-	"os"
-	"strconv"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/a-h/templ"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/cel-go/common/types"
+	"github.com/google/uuid"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TecharoHQ/anubis"
-	"github.com/TecharoHQ/anubis/data"
 	"github.com/TecharoHQ/anubis/decaymap"
 	"github.com/TecharoHQ/anubis/internal"
 	"github.com/TecharoHQ/anubis/internal/dnsbl"
 	"github.com/TecharoHQ/anubis/internal/ogtags"
+	"github.com/TecharoHQ/anubis/lib/challenge"
+	"github.com/TecharoHQ/anubis/lib/localization"
 	"github.com/TecharoHQ/anubis/lib/policy"
+	"github.com/TecharoHQ/anubis/lib/policy/checker"
 	"github.com/TecharoHQ/anubis/lib/policy/config"
-	"github.com/TecharoHQ/anubis/web"
-	"github.com/TecharoHQ/anubis/xess"
+	"github.com/TecharoHQ/anubis/lib/store"
+
+	// challenge implementations
+	_ "github.com/TecharoHQ/anubis/lib/challenge/metarefresh"
+	_ "github.com/TecharoHQ/anubis/lib/challenge/preact"
+	_ "github.com/TecharoHQ/anubis/lib/challenge/proofofwork"
 )
 
 var (
-	challengesIssued = promauto.NewCounter(prometheus.CounterOpts{
+	challengesIssued = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "anubis_challenges_issued",
 		Help: "The total number of challenges issued",
-	})
+	}, []string{"method"})
 
-	challengesValidated = promauto.NewCounter(prometheus.CounterOpts{
+	challengesValidated = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "anubis_challenges_validated",
 		Help: "The total number of challenges validated",
-	})
+	}, []string{"method"})
 
 	droneBLHits = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "anubis_dronebl_hits",
 		Help: "The total number of hits from DroneBL",
 	}, []string{"status"})
 
-	failedValidations = promauto.NewCounter(prometheus.CounterOpts{
+	failedValidations = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "anubis_failed_validations",
 		Help: "The total number of failed validations",
-	})
+	}, []string{"method"})
 
-	timeTaken = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "anubis_time_taken",
-		Help:    "The time taken for a browser to generate a response (milliseconds)",
-		Buckets: prometheus.ExponentialBucketsRange(1, math.Pow(2, 18), 19),
-	})
+	requestsProxied = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "anubis_proxied_requests_total",
+		Help: "Number of requests proxied through Anubis to upstream targets",
+	}, []string{"host"})
 )
 
-type Options struct {
-	Next           http.Handler
-	Policy         *policy.ParsedConfig
-	ServeRobotsTXT bool
-	PrivateKey     ed25519.PrivateKey
-
-	CookieDomain      string
-	CookieName        string
-	CookiePartitioned bool
-
-	OGPassthrough bool
-	OGTimeToLive  time.Duration
-	Target        string
-
-	WebmasterEmail string
+type Server struct {
+	next        http.Handler
+	mux         *http.ServeMux
+	policy      *policy.ParsedConfig
+	OGTags      *ogtags.OGTagCache
+	ed25519Priv ed25519.PrivateKey
+	hs512Secret []byte
+	opts        Options
+	store       store.Interface
+	logger      *slog.Logger
 }
 
-func LoadPoliciesOrDefault(fname string, defaultDifficulty int) (*policy.ParsedConfig, error) {
-	var fin io.ReadCloser
-	var err error
-
-	if fname != "" {
-		fin, err = os.Open(fname)
-		if err != nil {
-			return nil, fmt.Errorf("can't parse policy file %s: %w", fname, err)
+func (s *Server) getTokenKeyfunc() jwt.Keyfunc {
+	// return ED25519 key if HS512 is not set
+	if len(s.hs512Secret) == 0 {
+		return func(token *jwt.Token) (interface{}, error) {
+			return s.ed25519Priv.Public().(ed25519.PublicKey), nil
 		}
 	} else {
-		fname = "(data)/botPolicies.json"
-		fin, err = data.BotPolicies.Open("botPolicies.json")
-		if err != nil {
-			return nil, fmt.Errorf("[unexpected] can't parse builtin policy file %s: %w", fname, err)
+		return func(token *jwt.Token) (interface{}, error) {
+			return s.hs512Secret, nil
 		}
 	}
-
-	defer fin.Close()
-
-	anubisPolicy, err := policy.ParseConfig(fin, fname, defaultDifficulty)
-
-	return anubisPolicy, err
 }
 
-func New(opts Options) (*Server, error) {
-	if opts.PrivateKey == nil {
-		slog.Debug("opts.PrivateKey not set, generating a new one")
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("lib: can't generate private key: %v", err)
-		}
-		opts.PrivateKey = priv
+func (s *Server) getChallenge(r *http.Request) (*challenge.Challenge, error) {
+	id := r.FormValue("id")
+	j := store.JSON[challenge.Challenge]{Underlying: s.store}
+
+	chall, err := j.Get(r.Context(), "challenge:"+id)
+
+	return &chall, err
+}
+
+func (s *Server) issueChallenge(ctx context.Context, r *http.Request, lg *slog.Logger, cr policy.CheckResult, rule *policy.Bot) (*challenge.Challenge, error) {
+	if cr.Rule != config.RuleChallenge {
+		slog.Error("this should be impossible, asked to issue a challenge but the rule is not a challenge rule", "cr", cr, "rule", rule)
+		//return nil, errors.New("[unexpected] this codepath should be impossible, asked to issue a challenge for a non-challenge rule")
 	}
 
-	result := &Server{
-		next:       opts.Next,
-		priv:       opts.PrivateKey,
-		pub:        opts.PrivateKey.Public().(ed25519.PublicKey),
-		policy:     opts.Policy,
-		opts:       opts,
-		DNSBLCache: decaymap.New[string, dnsbl.DroneBLResponse](),
-		OGTags:     ogtags.NewOGTagCache(opts.Target, opts.OGPassthrough, opts.OGTimeToLive),
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, err
 	}
 
-	mux := http.NewServeMux()
-	xess.Mount(mux)
-
-	mux.Handle(anubis.StaticPath, internal.UnchangingCache(internal.NoBrowsing(http.StripPrefix(anubis.StaticPath, http.FileServerFS(web.Static)))))
-
-	if opts.ServeRobotsTXT {
-		mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
-			http.ServeFileFS(w, r, web.Static, "static/robots.txt")
-		})
-
-		mux.HandleFunc("/.well-known/robots.txt", func(w http.ResponseWriter, r *http.Request) {
-			http.ServeFileFS(w, r, web.Static, "static/robots.txt")
-		})
+	var randomData = make([]byte, 64)
+	if _, err := rand.Read(randomData); err != nil {
+		return nil, err
 	}
 
-	// mux.HandleFunc("GET /.within.website/x/cmd/anubis/static/js/main.mjs", serveMainJSWithBestEncoding)
+	chall := challenge.Challenge{
+		ID:         id.String(),
+		Method:     rule.Challenge.Algorithm,
+		RandomData: fmt.Sprintf("%x", randomData),
+		IssuedAt:   time.Now(),
+		Metadata: map[string]string{
+			"User-Agent": r.Header.Get("User-Agent"),
+			"X-Real-Ip":  r.Header.Get("X-Real-Ip"),
+		},
+	}
 
-	mux.HandleFunc("POST /.within.website/x/cmd/anubis/api/make-challenge", result.MakeChallenge)
-	mux.HandleFunc("GET /.within.website/x/cmd/anubis/api/pass-challenge", result.PassChallenge)
-	mux.HandleFunc("GET /.within.website/x/cmd/anubis/api/test-error", result.TestError)
+	j := store.JSON[challenge.Challenge]{Underlying: s.store}
+	if err := j.Set(ctx, "challenge:"+id.String(), chall, 30*time.Minute); err != nil {
+		return nil, err
+	}
 
-	mux.HandleFunc("/", result.MaybeReverseProxy)
+	lg.Info("new challenge issued", "challenge", id.String())
 
-	result.mux = mux
-
-	return result, nil
+	return &chall, err
 }
 
-type Server struct {
-	mux        *http.ServeMux
-	next       http.Handler
-	priv       ed25519.PrivateKey
-	pub        ed25519.PublicKey
-	policy     *policy.ParsedConfig
-	opts       Options
-	DNSBLCache *decaymap.Impl[string, dnsbl.DroneBLResponse]
-	OGTags     *ogtags.OGTagCache
+func (s *Server) maybeReverseProxyHttpStatusOnly(w http.ResponseWriter, r *http.Request) {
+	s.maybeReverseProxy(w, r, true)
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+func (s *Server) maybeReverseProxyOrPage(w http.ResponseWriter, r *http.Request) {
+	s.maybeReverseProxy(w, r, false)
 }
 
-func (s *Server) challengeFor(r *http.Request, difficulty int) string {
-	fp := sha256.Sum256(s.priv.Seed())
+func (s *Server) maybeReverseProxy(w http.ResponseWriter, r *http.Request, httpStatusOnly bool) {
+	lg := internal.GetRequestLogger(s.logger, r)
 
-	challengeData := fmt.Sprintf(
-		"Accept-Language=%s,X-Real-IP=%s,User-Agent=%s,WeekTime=%s,Fingerprint=%x,Difficulty=%d",
-		r.Header.Get("Accept-Language"),
-		r.Header.Get("X-Real-Ip"),
-		r.UserAgent(),
-		time.Now().UTC().Round(24*7*time.Hour).Format(time.RFC3339),
-		fp,
-		difficulty,
-	)
-	return internal.SHA256sum(challengeData)
-}
+	if val, _ := s.store.Get(r.Context(), fmt.Sprintf("ogtags:allow:%s%s", r.Host, r.URL.String())); val != nil {
+		lg.Debug("serving opengraph tag asset")
+		s.ServeHTTPNext(w, r)
+		return
+	}
 
-func (s *Server) MaybeReverseProxy(w http.ResponseWriter, r *http.Request) {
-	lg := slog.With(
-		"user_agent", r.UserAgent(),
-		"accept_language", r.Header.Get("Accept-Language"),
-		"priority", r.Header.Get("Priority"),
-		"x-forwarded-for",
-		r.Header.Get("X-Forwarded-For"),
-		"x-real-ip", r.Header.Get("X-Real-Ip"),
-	)
+	// Adjust cookie path if base prefix is not empty
+	cookiePath := "/"
+	if anubis.BasePrefix != "" {
+		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+	}
 
-	cr, rule, err := s.check(r)
+	cr, rule, err := s.check(r, lg)
 	if err != nil {
 		lg.Error("check failed", "err", err)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("Internal Server Error: administrator has misconfigured Anubis. Please contact the administrator and ask them to look for the logs around \"maybeReverseProxy\"", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+		localizer := localization.GetLocalizer(r)
+		s.respondWithError(w, r, fmt.Sprintf("%s \"maybeReverseProxy\"", localizer.T("internal_server_error")))
 		return
 	}
 
 	r.Header.Add("X-Anubis-Rule", cr.Name)
 	r.Header.Add("X-Anubis-Action", string(cr.Rule))
 	lg = lg.With("check_result", cr)
-	policy.PolicyApplications.WithLabelValues(cr.Name, string(cr.Rule)).Add(1)
+	policy.Applications.WithLabelValues(cr.Name, string(cr.Rule)).Add(1)
 
 	ip := r.Header.Get("X-Real-Ip")
 
-	if s.policy.DNSBL && ip != "" {
-		resp, ok := s.DNSBLCache.Get(ip)
-		if !ok {
-			lg.Debug("looking up ip in dnsbl")
-			resp, err := dnsbl.Lookup(ip)
-			if err != nil {
-				lg.Error("can't look up ip in dnsbl", "err", err)
-			}
-			s.DNSBLCache.Set(ip, resp, 24*time.Hour)
-			droneBLHits.WithLabelValues(resp.String()).Inc()
-		}
-
-		if resp != dnsbl.AllGood {
-			lg.Info("DNSBL hit", "status", resp.String())
-			templ.Handler(web.Base("Oh noes!", web.ErrorPage(fmt.Sprintf("DroneBL reported an entry: %s, see https://dronebl.org/lookup?ip=%s", resp.String(), ip), s.opts.WebmasterEmail)), templ.WithStatus(http.StatusOK)).ServeHTTP(w, r)
-			return
-		}
+	if s.handleDNSBL(w, r, ip, lg) {
+		return
 	}
 
-	switch cr.Rule {
-	case config.RuleAllow:
-		lg.Debug("allowing traffic to origin (explicit)")
-		s.next.ServeHTTP(w, r)
-		return
-	case config.RuleDeny:
-		s.ClearCookie(w)
-		lg.Info("explicit deny")
-		if rule == nil {
-			lg.Error("rule is nil, cannot calculate checksum")
-			templ.Handler(web.Base("Oh noes!", web.ErrorPage("Other internal server error (contact the admin)", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
-			return
-		}
-		hash, err := rule.Hash()
-		if err != nil {
-			lg.Error("can't calculate checksum of rule", "err", err)
-			templ.Handler(web.Base("Oh noes!", web.ErrorPage("Other internal server error (contact the admin)", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
-			return
-		}
-		lg.Debug("rule hash", "hash", hash)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage(fmt.Sprintf("Access Denied: error code %s", hash), s.opts.WebmasterEmail)), templ.WithStatus(http.StatusOK)).ServeHTTP(w, r)
-		return
-	case config.RuleChallenge:
-		lg.Debug("challenge requested")
-	case config.RuleBenchmark:
-		lg.Debug("serving benchmark page")
-		s.RenderBench(w, r)
-		return
-	default:
-		s.ClearCookie(w)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("Other internal server error (contact the admin)", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+	if s.checkRules(w, r, cr, lg, rule) {
 		return
 	}
 
 	ckie, err := r.Cookie(anubis.CookieName)
 	if err != nil {
 		lg.Debug("cookie not found", "path", r.URL.Path)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
 	if err := ckie.Valid(); err != nil {
 		lg.Debug("cookie is invalid", "err", err)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
 	if time.Now().After(ckie.Expires) && !ckie.Expires.IsZero() {
 		lg.Debug("cookie expired", "path", r.URL.Path)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
-	token, err := jwt.ParseWithClaims(ckie.Value, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return s.pub, nil
-	}, jwt.WithExpirationRequired(), jwt.WithStrictDecoding())
+	token, err := jwt.ParseWithClaims(ckie.Value, jwt.MapClaims{}, s.getTokenKeyfunc(), jwt.WithExpirationRequired(), jwt.WithStrictDecoding())
 
 	if err != nil || !token.Valid {
 		lg.Debug("invalid token", "path", r.URL.Path, "err", err)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
-		return
-	}
-
-	if randomJitter() {
-		r.Header.Add("X-Anubis-Status", "PASS-BRIEF")
-		lg.Debug("cookie is not enrolled into secondary screening")
-		s.next.ServeHTTP(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		lg.Debug("invalid token claims type", "path", r.URL.Path)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
-		return
-	}
-	challenge := s.challengeFor(r, rule.Challenge.Difficulty)
-
-	if claims["challenge"] != challenge {
-		lg.Debug("invalid challenge", "path", r.URL.Path)
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
-	var nonce int
-
-	if v, ok := claims["nonce"].(float64); ok {
-		nonce = int(v)
-	}
-
-	calcString := fmt.Sprintf("%s%d", challenge, nonce)
-	calculated := internal.SHA256sum(calcString)
-
-	if subtle.ConstantTimeCompare([]byte(claims["response"].(string)), []byte(calculated)) != 1 {
-		lg.Debug("invalid response", "path", r.URL.Path)
-		failedValidations.Inc()
-		s.ClearCookie(w)
-		s.RenderIndex(w, r)
+	policyRule, ok := claims["policyRule"].(string)
+	if !ok {
+		lg.Debug("policyRule claim is not a string")
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
 		return
 	}
 
-	slog.Debug("all checks passed")
-	r.Header.Add("X-Anubis-Status", "PASS-FULL")
-	s.next.ServeHTTP(w, r)
+	if policyRule != rule.Hash() {
+		lg.Debug("user originally passed with a different rule, issuing new challenge", "old", policyRule, "new", rule.Name)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
+		return
+	}
+
+	if s.opts.JWTRestrictionHeader != "" && claims["restriction"] != internal.SHA256sum(r.Header.Get(s.opts.JWTRestrictionHeader)) {
+		lg.Debug("JWT restriction header is invalid")
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.RenderIndex(w, r, cr, rule, httpStatusOnly)
+		return
+	}
+
+	r.Header.Add("X-Anubis-Status", "PASS")
+	s.ServeHTTPNext(w, r)
 }
 
-func (s *Server) RenderIndex(w http.ResponseWriter, r *http.Request) {
-	var ogTags map[string]string = nil
-	if s.opts.OGPassthrough {
-		var err error
-		ogTags, err = s.OGTags.GetOGTags(r.URL)
+func (s *Server) checkRules(w http.ResponseWriter, r *http.Request, cr policy.CheckResult, lg *slog.Logger, rule *policy.Bot) bool {
+	// Adjust cookie path if base prefix is not empty
+	cookiePath := "/"
+	if anubis.BasePrefix != "" {
+		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+	}
+
+	localizer := localization.GetLocalizer(r)
+
+	switch cr.Rule {
+	case config.RuleAllow:
+		lg.Debug("allowing traffic to origin (explicit)")
+		s.ServeHTTPNext(w, r)
+		return true
+	case config.RuleDeny:
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		lg.Info("explicit deny")
+		if rule == nil {
+			lg.Error("rule is nil, cannot calculate checksum")
+			s.respondWithError(w, r, fmt.Sprintf("%s \"maybeReverseProxy.RuleDeny\"", localizer.T("internal_server_error")))
+			return true
+		}
+		hash := rule.Hash()
+
+		lg.Debug("rule hash", "hash", hash)
+		s.respondWithStatus(w, r, fmt.Sprintf("%s %s", localizer.T("access_denied"), hash), s.policy.StatusCodes.Deny)
+		return true
+	case config.RuleChallenge:
+		lg.Debug("challenge requested")
+	case config.RuleBenchmark:
+		lg.Debug("serving benchmark page")
+		s.RenderBench(w, r)
+		return true
+	default:
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		lg.Error("CONFIG ERROR: unknown rule", "rule", cr.Rule)
+		s.respondWithError(w, r, fmt.Sprintf("%s \"maybeReverseProxy.Rules\"", localizer.T("internal_server_error")))
+		return true
+	}
+	return false
+}
+
+func (s *Server) handleDNSBL(w http.ResponseWriter, r *http.Request, ip string, lg *slog.Logger) bool {
+	db := &store.JSON[dnsbl.DroneBLResponse]{Underlying: s.store, Prefix: "dronebl:"}
+	if s.policy.DNSBL && ip != "" {
+		resp, err := db.Get(r.Context(), ip)
 		if err != nil {
-			slog.Error("failed to get OG tags", "err", err)
-			ogTags = nil
+			lg.Debug("looking up ip in dnsbl")
+			resp, err := dnsbl.Lookup(ip)
+			if err != nil {
+				lg.Error("can't look up ip in dnsbl", "err", err)
+			}
+			db.Set(r.Context(), ip, resp, 24*time.Hour)
+			droneBLHits.WithLabelValues(resp.String()).Inc()
+		}
+
+		if resp != dnsbl.AllGood {
+			lg.Info("DNSBL hit", "status", resp.String())
+			localizer := localization.GetLocalizer(r)
+			s.respondWithStatus(w, r, fmt.Sprintf("%s: %s, %s https://dronebl.org/lookup?ip=%s",
+				localizer.T("dronebl_entry"),
+				resp.String(),
+				localizer.T("see_dronebl_lookup"),
+				ip), s.policy.StatusCodes.Deny)
+			return true
 		}
 	}
-	handler := internal.NoStoreCache(
-		templ.Handler(
-			web.BaseWithOGTags("Making sure you're not a bot!", web.Index(), ogTags),
-		),
-	)
-	handler.ServeHTTP(w, r)
-}
-
-func (s *Server) RenderBench(w http.ResponseWriter, r *http.Request) {
-	templ.Handler(
-		web.Base("Benchmarking Anubis!", web.Bench()),
-	).ServeHTTP(w, r)
+	return false
 }
 
 func (s *Server) MakeChallenge(w http.ResponseWriter, r *http.Request) {
-	lg := slog.With("user_agent", r.UserAgent(), "accept_language", r.Header.Get("Accept-Language"), "priority", r.Header.Get("Priority"), "x-forwarded-for", r.Header.Get("X-Forwarded-For"), "x-real-ip", r.Header.Get("X-Real-Ip"))
+	lg := internal.GetRequestLogger(s.logger, r)
+	localizer := localization.GetLocalizer(r)
 
-	cr, rule, err := s.check(r)
-	if err != nil {
-		lg.Error("check failed", "err", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(struct {
+	redir := r.FormValue("redir")
+	if redir == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		encoder := json.NewEncoder(w)
+		lg.Error("invalid invocation of MakeChallenge", "redir", redir)
+		encoder.Encode(struct {
 			Error string `json:"error"`
 		}{
-			Error: "Internal Server Error: administrator has misconfigured Anubis. Please contact the administrator and ask them to look for the logs around \"makeChallenge\"",
+			Error: localizer.T("invalid_invocation"),
 		})
 		return
 	}
-	lg = lg.With("check_result", cr)
-	challenge := s.challengeFor(r, rule.Challenge.Difficulty)
 
-	json.NewEncoder(w).Encode(struct {
-		Challenge string                 `json:"challenge"`
+	r.URL.Path = redir
+
+	encoder := json.NewEncoder(w)
+	cr, rule, err := s.check(r, lg)
+	if err != nil {
+		lg.Error("check failed", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		err := encoder.Encode(struct {
+			Error string `json:"error"`
+		}{
+			Error: fmt.Sprintf("%s \"makeChallenge\"", localizer.T("internal_server_error")),
+		})
+		if err != nil {
+			lg.Error("failed to encode error response", "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		return
+	}
+	lg = lg.With("check_result", cr)
+
+	chall, err := s.issueChallenge(r.Context(), r, lg, cr, rule)
+	if err != nil {
+		lg.Error("failed to fetch or issue challenge", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		err := encoder.Encode(struct {
+			Error string `json:"error"`
+		}{
+			Error: fmt.Sprintf("%s \"makeChallenge\"", localizer.T("internal_server_error")),
+		})
+		if err != nil {
+			lg.Error("failed to encode error response", "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		return
+	}
+
+	s.SetCookie(w, CookieOpts{Host: r.Host, Name: anubis.TestCookieName, Value: chall.ID})
+
+	err = encoder.Encode(struct {
 		Rules     *config.ChallengeRules `json:"rules"`
+		Challenge string                 `json:"challenge"`
+		ID        string                 `json:"id"`
 	}{
-		Challenge: challenge,
 		Rules:     rule.Challenge,
+		Challenge: chall.RandomData,
+		ID:        chall.ID,
 	})
-	lg.Debug("made challenge", "challenge", challenge, "rules", rule.Challenge, "cr", cr)
-	challengesIssued.Inc()
+	if err != nil {
+		lg.Error("failed to encode challenge", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	lg.Debug("made challenge", "challenge", chall, "rules", rule.Challenge, "cr", cr)
+	challengesIssued.WithLabelValues("api").Inc()
 }
 
 func (s *Server) PassChallenge(w http.ResponseWriter, r *http.Request) {
-	lg := slog.With(
-		"user_agent", r.UserAgent(),
-		"accept_language", r.Header.Get("Accept-Language"),
-		"priority", r.Header.Get("Priority"),
-		"x-forwarded-for", r.Header.Get("X-Forwarded-For"),
-		"x-real-ip", r.Header.Get("X-Real-Ip"),
-	)
+	lg := internal.GetRequestLogger(s.logger, r)
+	localizer := localization.GetLocalizer(r)
 
-	cr, rule, err := s.check(r)
+	redir := r.FormValue("redir")
+	redirURL, err := url.ParseRequestURI(redir)
+	if err != nil {
+		lg.Error("invalid redirect", "err", err)
+		s.respondWithStatus(w, r, localizer.T("invalid_redirect"), http.StatusBadRequest)
+		return
+	}
+
+	switch redirURL.Scheme {
+	case "", "http", "https":
+		// allowed
+	default:
+		lg.Error("XSS attempt blocked, invalid redirect scheme", "scheme", redirURL.Scheme)
+		s.respondWithStatus(w, r, localizer.T("invalid_redirect"), http.StatusBadRequest)
+		return
+	}
+
+	// Adjust cookie path if base prefix is not empty
+	cookiePath := "/"
+	if anubis.BasePrefix != "" {
+		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+	}
+
+	if _, err := r.Cookie(anubis.TestCookieName); errors.Is(err, http.ErrNoCookie) {
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.ClearCookie(w, CookieOpts{Name: anubis.TestCookieName, Host: r.Host})
+		lg.Warn("user has cookies disabled, this is not an anubis bug")
+		s.respondWithError(w, r, localizer.T("cookies_disabled"))
+		return
+	}
+
+	// used by the path checker rule
+	r.URL = redirURL
+
+	urlParsed, err := r.URL.Parse(redir)
+	if err != nil {
+		s.respondWithError(w, r, localizer.T("redirect_not_parseable"))
+		return
+	}
+	if (len(urlParsed.Host) > 0 && len(s.opts.RedirectDomains) != 0 && !matchRedirectDomain(s.opts.RedirectDomains, urlParsed.Host)) || urlParsed.Host != r.URL.Host {
+		lg.Debug("domain not allowed", "domain", urlParsed.Host)
+		s.respondWithError(w, r, localizer.T("redirect_domain_not_allowed"))
+		return
+	}
+
+	cr, rule, err := s.check(r, lg)
 	if err != nil {
 		lg.Error("check failed", "err", err)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("Internal Server Error: administrator has misconfigured Anubis. Please contact the administrator and ask them to look for the logs around \"passChallenge\".", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+		s.respondWithError(w, r, fmt.Sprintf("%s \"passChallenge\"", localizer.T("internal_server_error")))
 		return
 	}
 	lg = lg.With("check_result", cr)
 
-	nonceStr := r.FormValue("nonce")
-	if nonceStr == "" {
-		s.ClearCookie(w)
-		lg.Debug("no nonce")
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("missing nonce", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
-		return
-	}
-
-	elapsedTimeStr := r.FormValue("elapsedTime")
-	if elapsedTimeStr == "" {
-		s.ClearCookie(w)
-		lg.Debug("no elapsedTime")
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("missing elapsedTime", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
-		return
-	}
-
-	elapsedTime, err := strconv.ParseFloat(elapsedTimeStr, 64)
+	chall, err := s.getChallenge(r)
 	if err != nil {
-		s.ClearCookie(w)
-		lg.Debug("elapsedTime doesn't parse", "err", err)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("invalid elapsedTime", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+		lg.Error("getChallenge failed", "err", err)
+		s.respondWithError(w, r, fmt.Sprintf("%s: %s", localizer.T("internal_server_error"), rule.Challenge.Algorithm))
 		return
 	}
 
-	lg.Info("challenge took", "elapsedTime", elapsedTime)
-	timeTaken.Observe(elapsedTime)
-
-	response := r.FormValue("response")
-	redir := r.FormValue("redir")
-
-	challenge := s.challengeFor(r, rule.Challenge.Difficulty)
-
-	nonce, err := strconv.Atoi(nonceStr)
-	if err != nil {
-		s.ClearCookie(w)
-		lg.Debug("nonce doesn't parse", "err", err)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("invalid nonce", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+	if chall.Spent {
+		lg.Error("double spend prevented", "reason", "double_spend")
+		s.respondWithError(w, r, fmt.Sprintf("%s: %s", localizer.T("internal_server_error"), "double_spend"))
 		return
 	}
 
-	calcString := fmt.Sprintf("%s%d", challenge, nonce)
-	calculated := internal.SHA256sum(calcString)
-
-	if subtle.ConstantTimeCompare([]byte(response), []byte(calculated)) != 1 {
-		s.ClearCookie(w)
-		lg.Debug("hash does not match", "got", response, "want", calculated)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("invalid response", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusForbidden)).ServeHTTP(w, r)
-		failedValidations.Inc()
+	impl, ok := challenge.Get(chall.Method)
+	if !ok {
+		lg.Error("check failed", "err", err)
+		s.respondWithError(w, r, fmt.Sprintf("%s: %s", localizer.T("internal_server_error"), rule.Challenge.Algorithm))
 		return
 	}
 
-	// compare the leading zeroes
-	if !strings.HasPrefix(response, strings.Repeat("0", rule.Challenge.Difficulty)) {
-		s.ClearCookie(w)
-		lg.Debug("difficulty check failed", "response", response, "difficulty", rule.Challenge.Difficulty)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("invalid response", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusForbidden)).ServeHTTP(w, r)
-		failedValidations.Inc()
-		return
+	lg = lg.With("challenge", chall.ID)
+
+	in := &challenge.ValidateInput{
+		Challenge: chall,
+		Rule:      rule,
+		Store:     s.store,
+	}
+
+	if err := impl.Validate(r, lg, in); err != nil {
+		failedValidations.WithLabelValues(rule.Challenge.Algorithm).Inc()
+		var cerr *challenge.Error
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		lg.Debug("challenge validate call failed", "err", err)
+
+		switch {
+		case errors.As(err, &cerr):
+			switch {
+			case errors.Is(err, challenge.ErrFailed):
+				lg.Error("challenge failed", "err", err)
+				s.respondWithStatus(w, r, cerr.PublicReason, cerr.StatusCode)
+				return
+			case errors.Is(err, challenge.ErrInvalidFormat), errors.Is(err, challenge.ErrMissingField):
+				lg.Error("invalid challenge format", "err", err)
+				s.respondWithError(w, r, cerr.PublicReason)
+				return
+			}
+		}
 	}
 
 	// generate JWT cookie
-	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, jwt.MapClaims{
-		"challenge": challenge,
-		"nonce":     nonce,
-		"response":  response,
-		"iat":       time.Now().Unix(),
-		"nbf":       time.Now().Add(-1 * time.Minute).Unix(),
-		"exp":       time.Now().Add(24 * 7 * time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString(s.priv)
+	var tokenString string
+
+	// check if JWTRestrictionHeader is set and header is in request
+	if s.opts.JWTRestrictionHeader != "" {
+		if r.Header.Get(s.opts.JWTRestrictionHeader) == "" {
+			lg.Error("JWTRestrictionHeader is set in config but not found in request, please check your reverse proxy config.")
+			s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+			s.respondWithError(w, r, "failed to sign JWT")
+			return
+		} else {
+			tokenString, err = s.signJWT(jwt.MapClaims{
+				"challenge":   chall.ID,
+				"method":      rule.Challenge.Algorithm,
+				"policyRule":  rule.Hash(),
+				"action":      string(cr.Rule),
+				"restriction": internal.SHA256sum(r.Header.Get(s.opts.JWTRestrictionHeader)),
+			})
+		}
+	} else {
+		tokenString, err = s.signJWT(jwt.MapClaims{
+			"challenge":  chall.ID,
+			"method":     rule.Challenge.Algorithm,
+			"policyRule": rule.Hash(),
+			"action":     string(cr.Rule),
+		})
+	}
+
 	if err != nil {
 		lg.Error("failed to sign JWT", "err", err)
-		s.ClearCookie(w)
-		templ.Handler(web.Base("Oh noes!", web.ErrorPage("failed to sign JWT", s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+		s.respondWithError(w, r, localizer.T("failed_to_sign_jwt"))
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:        anubis.CookieName,
-		Value:       tokenString,
-		Expires:     time.Now().Add(24 * 7 * time.Hour),
-		SameSite:    http.SameSiteLaxMode,
-		Domain:      s.opts.CookieDomain,
-		Partitioned: s.opts.CookiePartitioned,
-		Path:        "/",
-	})
+	s.SetCookie(w, CookieOpts{Path: cookiePath, Host: r.Host, Value: tokenString})
 
-	challengesValidated.Inc()
+	chall.Spent = true
+	j := store.JSON[challenge.Challenge]{Underlying: s.store}
+	if err := j.Set(r.Context(), "challenge:"+chall.ID, *chall, 30*time.Minute); err != nil {
+		lg.Debug("can't update information about challenge", "err", err)
+	}
+
+	challengesValidated.WithLabelValues(rule.Challenge.Algorithm).Inc()
 	lg.Debug("challenge passed, redirecting to app")
 	http.Redirect(w, r, redir, http.StatusFound)
 }
 
-func (s *Server) TestError(w http.ResponseWriter, r *http.Request) {
-	err := r.FormValue("err")
-	templ.Handler(web.Base("Oh noes!", web.ErrorPage(err, s.opts.WebmasterEmail)), templ.WithStatus(http.StatusInternalServerError)).ServeHTTP(w, r)
+func cr(name string, rule config.Rule, weight int) policy.CheckResult {
+	return policy.CheckResult{
+		Name:   name,
+		Rule:   rule,
+		Weight: weight,
+	}
 }
 
 // Check evaluates the list of rules, and returns the result
-func (s *Server) check(r *http.Request) (CheckResult, *policy.Bot, error) {
+func (s *Server) check(r *http.Request, lg *slog.Logger) (policy.CheckResult, *policy.Bot, error) {
 	host := r.Header.Get("X-Real-Ip")
 	if host == "" {
-		return decaymap.Zilch[CheckResult](), nil, fmt.Errorf("[misconfiguration] X-Real-Ip header is not set")
+		return decaymap.Zilch[policy.CheckResult](), nil, fmt.Errorf("[misconfiguration] X-Real-Ip header is not set")
 	}
 
 	addr := net.ParseIP(host)
 	if addr == nil {
-		return decaymap.Zilch[CheckResult](), nil, fmt.Errorf("[misconfiguration] %q is not an IP address", host)
+		return decaymap.Zilch[policy.CheckResult](), nil, fmt.Errorf("[misconfiguration] %q is not an IP address", host)
 	}
+
+	weight := 0
 
 	for _, b := range s.policy.Bots {
-		if b.UserAgent != nil {
-			if b.UserAgent.MatchString(r.UserAgent()) && s.checkRemoteAddress(b, addr) {
-				return cr("bot/"+b.Name, b.Action), &b, nil
-			}
+		match, err := b.Rules.Check(r)
+		if err != nil {
+			return decaymap.Zilch[policy.CheckResult](), nil, fmt.Errorf("can't run check %s: %w", b.Name, err)
 		}
 
-		if b.Path != nil {
-			if b.Path.MatchString(r.URL.Path) && s.checkRemoteAddress(b, addr) {
-				return cr("bot/"+b.Name, b.Action), &b, nil
-			}
-		}
-
-		if b.Ranger != nil {
-			if s.checkRemoteAddress(b, addr) {
-				return cr("bot/"+b.Name, b.Action), &b, nil
+		if match {
+			switch b.Action {
+			case config.RuleDeny, config.RuleAllow, config.RuleBenchmark, config.RuleChallenge:
+				return cr("bot/"+b.Name, b.Action, weight), &b, nil
+			case config.RuleWeigh:
+				lg.Debug("adjusting weight", "name", b.Name, "delta", b.Weight.Adjust)
+				weight += b.Weight.Adjust
 			}
 		}
 	}
 
-	return cr("default/allow", config.RuleAllow), &policy.Bot{
+	for _, t := range s.policy.Thresholds {
+		result, _, err := t.Program.ContextEval(r.Context(), &policy.ThresholdRequest{Weight: weight})
+		if err != nil {
+			lg.Error("error when evaluating threshold expression", "expression", t.Expression.String(), "err", err)
+			continue
+		}
+
+		var matches bool
+
+		if val, ok := result.(types.Bool); ok {
+			matches = bool(val)
+		}
+
+		if matches {
+			return cr("threshold/"+t.Name, t.Action, weight), &policy.Bot{
+				Challenge: t.Challenge,
+				Rules:     &checker.List{},
+			}, nil
+		}
+	}
+
+	return cr("default/allow", config.RuleAllow, weight), &policy.Bot{
 		Challenge: &config.ChallengeRules{
 			Difficulty: s.policy.DefaultDifficulty,
 			ReportAs:   s.policy.DefaultDifficulty,
-			Algorithm:  config.AlgorithmFast,
+			Algorithm:  config.DefaultAlgorithm,
 		},
+		Rules: &checker.List{},
 	}, nil
-}
-
-func (s *Server) checkRemoteAddress(b policy.Bot, addr net.IP) bool {
-	if b.Ranger == nil {
-		return true
-	}
-
-	ok, err := b.Ranger.Contains(addr)
-	if err != nil {
-		log.Panicf("[unexpected] something very funky is going on, %q does not have a calculable network number: %v", addr.String(), err)
-	}
-
-	return ok
-}
-
-func (s *Server) CleanupDecayMap() {
-	s.DNSBLCache.Cleanup()
-	s.OGTags.Cleanup()
 }

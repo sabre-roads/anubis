@@ -1,20 +1,23 @@
-package config
+package config_test
 
 import (
-	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/TecharoHQ/anubis/data"
+	. "github.com/TecharoHQ/anubis/lib/policy/config"
 )
 
 func p[V any](v V) *V { return &v }
 
 func TestBotValid(t *testing.T) {
 	var tests = []struct {
+		err  error
 		name string
 		bot  BotConfig
-		err  error
 	}{
 		{
 			name: "simple user agent",
@@ -88,13 +91,25 @@ func TestBotValid(t *testing.T) {
 			err: ErrInvalidPathRegex,
 		},
 		{
+			name: "invalid headers regex",
+			bot: BotConfig{
+				Name:   "mozilla-ua",
+				Action: RuleChallenge,
+				HeadersRegex: map[string]string{
+					"Content-Type": "a(b",
+				},
+				PathRegex: p("a(b"),
+			},
+			err: ErrInvalidHeadersRegex,
+		},
+		{
 			name: "challenge difficulty too low",
 			bot: BotConfig{
 				Name:      "mozilla-ua",
 				Action:    RuleChallenge,
 				PathRegex: p("Mozilla"),
 				Challenge: &ChallengeRules{
-					Difficulty: 0,
+					Difficulty: -1,
 					ReportAs:   4,
 					Algorithm:  "fast",
 				},
@@ -114,20 +129,6 @@ func TestBotValid(t *testing.T) {
 				},
 			},
 			err: ErrChallengeDifficultyTooHigh,
-		},
-		{
-			name: "challenge wrong algorithm",
-			bot: BotConfig{
-				Name:      "mozilla-ua",
-				Action:    RuleChallenge,
-				PathRegex: p("Mozilla"),
-				Challenge: &ChallengeRules{
-					Difficulty: 420,
-					ReportAs:   4,
-					Algorithm:  "high quality rips",
-				},
-			},
-			err: ErrChallengeRuleHasWrongAlgorithm,
 		},
 		{
 			name: "invalid cidr range",
@@ -166,6 +167,25 @@ func TestBotValid(t *testing.T) {
 				RemoteAddr: []string{"0.0.0.0/0"},
 			},
 			err: nil,
+		},
+		{
+			name: "weight rule without weight",
+			bot: BotConfig{
+				Name:           "weight-adjust-if-mozilla",
+				Action:         RuleWeigh,
+				UserAgentRegex: p("Mozilla"),
+			},
+		},
+		{
+			name: "weight rule with weight adjust",
+			bot: BotConfig{
+				Name:           "weight-adjust-if-mozilla",
+				Action:         RuleWeigh,
+				UserAgentRegex: p("Mozilla"),
+				Weight: &Weight{
+					Adjust: 5,
+				},
+			},
 		},
 	}
 
@@ -206,13 +226,73 @@ func TestConfigValidKnownGood(t *testing.T) {
 			}
 			defer fin.Close()
 
-			var c Config
-			if err := json.NewDecoder(fin).Decode(&c); err != nil {
-				t.Fatalf("can't decode file: %v", err)
+			c, err := Load(fin, st.Name())
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			if err := c.Valid(); err != nil {
-				t.Fatal(err)
+				t.Error(err)
+			}
+
+			if len(c.Bots) == 0 {
+				t.Error("wanted more than 0 bots, got zero")
+			}
+		})
+	}
+}
+
+func TestImportStatement(t *testing.T) {
+	type testCase struct {
+		err        error
+		name       string
+		importPath string
+	}
+
+	var tests []testCase
+
+	for _, folderName := range []string{
+		"apps",
+		"bots",
+		"common",
+		"crawlers",
+		"meta",
+	} {
+		if err := fs.WalkDir(data.BotPolicies, folderName, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if d.Name() == "README.md" {
+				return nil
+			}
+
+			tests = append(tests, testCase{
+				name:       "(data)/" + path,
+				importPath: "(data)/" + path,
+				err:        nil,
+			})
+
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := &ImportStatement{
+				Import: tt.importPath,
+			}
+
+			if err := is.Valid(); err != nil {
+				t.Errorf("validation error: %v", err)
+			}
+
+			if len(is.Bots) == 0 {
+				t.Error("wanted bot definitions, but got none")
 			}
 		})
 	}
@@ -233,16 +313,58 @@ func TestConfigValidBad(t *testing.T) {
 			}
 			defer fin.Close()
 
-			var c Config
-			if err := json.NewDecoder(fin).Decode(&c); err != nil {
-				t.Fatalf("can't decode file: %v", err)
-			}
-
-			if err := c.Valid(); err == nil {
+			_, err = Load(fin, filepath.Join("testdata", "bad", st.Name()))
+			if err == nil {
 				t.Fatal("validation should have failed but didn't somehow")
 			} else {
 				t.Log(err)
 			}
 		})
+	}
+}
+
+func TestBotConfigZero(t *testing.T) {
+	var b BotConfig
+	if !b.Zero() {
+		t.Error("zero value config.BotConfig is not zero value")
+	}
+
+	b.Name = "hi"
+	if b.Zero() {
+		t.Error("config.BotConfig with name is zero value")
+	}
+
+	b.UserAgentRegex = p(".*")
+	if b.Zero() {
+		t.Error("config.BotConfig with user agent regex is zero value")
+	}
+
+	b.PathRegex = p(".*")
+	if b.Zero() {
+		t.Error("config.BotConfig with path regex is zero value")
+	}
+
+	b.HeadersRegex = map[string]string{"hi": "there"}
+	if b.Zero() {
+		t.Error("config.BotConfig with headers regex is zero value")
+	}
+
+	b.Action = RuleAllow
+	if b.Zero() {
+		t.Error("config.BotConfig with action is zero value")
+	}
+
+	b.RemoteAddr = []string{"::/0"}
+	if b.Zero() {
+		t.Error("config.BotConfig with remote addresses is zero value")
+	}
+
+	b.Challenge = &ChallengeRules{
+		Difficulty: 4,
+		ReportAs:   4,
+		Algorithm:  DefaultAlgorithm,
+	}
+	if b.Zero() {
+		t.Error("config.BotConfig with challenge rules is zero value")
 	}
 }

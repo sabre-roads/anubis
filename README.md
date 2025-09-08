@@ -9,12 +9,60 @@
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/TecharoHQ/anubis)
 ![language count](https://img.shields.io/github/languages/count/TecharoHQ/anubis)
 ![repo size](https://img.shields.io/github/repo-size/TecharoHQ/anubis)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/Xe)](https://github.com/sponsors/Xe)
 
-Anubis [weighs the soul of your connection](https://en.wikipedia.org/wiki/Weighing_of_souls) using a sha256 proof-of-work challenge in order to protect upstream resources from scraper bots.
+## Sponsors
 
-Installing and using this will likely result in your website not being indexed by some search engines. This is considered a feature of Anubis, not a bug.
+Anubis is brought to you by sponsors and donors like:
 
-This is a bit of a nuclear response, but AI scraper bots scraping so aggressively have forced my hand. I hate that I have to do this, but this is what we get for the modern Internet because bots don't conform to standards like robots.txt, even when they claim to.
+### Diamond Tier
+
+<a href="https://www.raptorcs.com/content/base/products.html">
+  <img src="./docs/static/img/sponsors/raptor-computing-logo.webp" alt="Raptor Computing Systems" height=64 />
+</a>
+
+### Gold Tier
+
+<a href="https://distrust.co?utm_campaign=github&utm_medium=referral&utm_content=anubis">
+  <img src="./docs/static/img/sponsors/distrust-logo.webp" alt="Distrust" height="64">
+</a>
+<a href="https://terminaltrove.com/?utm_campaign=github&utm_medium=referral&utm_content=anubis&utm_source=abgh">
+  <img src="./docs/static/img/sponsors/terminal-trove.webp" alt="Terminal Trove" height="64">
+</a>
+<a href="https://canine.tools?utm_campaign=github&utm_medium=referral&utm_content=anubis">
+  <img src="./docs/static/img/sponsors/caninetools-logo.webp" alt="canine.tools" height="64">
+</a>
+<a href="https://weblate.org/">
+  <img src="./docs/static/img/sponsors/weblate-logo.webp" alt="Weblate" height="64">
+</a>
+<a href="https://uberspace.de/">
+  <img src="./docs/static/img/sponsors/uberspace-logo.webp" alt="Uberspace" height="64">
+</a>
+<a href="https://wildbase.xyz/">
+  <img src="./docs/static/img/sponsors/wildbase-logo.webp" alt="Wildbase" height="64">
+</a>
+<a href="https://emma.pet">
+  <img
+    src="./docs/static/img/sponsors/nepeat-logo.webp"
+    alt="Cat eyes over the word Emma in a serif font"
+    height="64"
+  />
+</a>
+<a href="https://fabulous.systems/">
+  <img
+    src="./docs/static/img/sponsors/fabulous-systems.webp"
+    alt="Cat eyes over the word Emma in a serif font"
+    height="64"
+  />
+</a>
+
+## Overview
+
+Anubis is a Web AI Firewall Utility that [weighs the soul of your connection](https://en.wikipedia.org/wiki/Weighing_of_souls) using one or more challenges in order to protect upstream resources from scraper bots.
+
+This program is designed to help protect the small internet from the endless storm of requests that flood in from AI companies. Anubis is as lightweight as possible to ensure that everyone can afford to protect the communities closest to them.
+
+Anubis is a bit of a nuclear response. This will result in your website being blocked from smaller scrapers and may inhibit "good bots" like the Internet Archive. You can configure [bot policy definitions](./docs/docs/admin/policies.mdx) to explicitly allowlist them and we are working on a curated set of "known good" bots to allow for a compromise between discoverability and uptime.
 
 In most cases, you should not need this and can probably get by using Cloudflare to protect a given origin. However, for circumstances where you can't or won't use Cloudflare, Anubis is there for you.
 
@@ -28,8 +76,22 @@ For live chat, please join the [Patreon](https://patreon.com/cadey) and ask in t
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=TecharoHQ/anubis&type=Date)](https://www.star-history.com/#TecharoHQ/anubis&Date)
+<a href="https://www.star-history.com/#TecharoHQ/anubis&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=TecharoHQ/anubis&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=TecharoHQ/anubis&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=TecharoHQ/anubis&type=Date" />
+ </picture>
+</a>
 
 ## Packaging Status
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/anubis-anti-crawler.svg)](https://repology.org/project/anubis-anti-crawler/versions)
+[![Packaging status](https://repology.org/badge/vertical-allrepos/anubis-anti-crawler.svg?columns=3)](https://repology.org/project/anubis-anti-crawler/versions)
+
+## Contributors
+
+<a href="https://github.com/TecharoHQ/anubis/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=TecharoHQ/anubis" />
+</a>
+
+Made with [contrib.rocks](https://contrib.rocks).

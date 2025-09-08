@@ -12,8 +12,6 @@ import (
 	"github.com/TecharoHQ/anubis/internal"
 )
 
-//go:generate go tool github.com/a-h/templ/cmd/templ generate
-
 var (
 	//go:embed *.css static
 	Static embed.FS
@@ -24,6 +22,7 @@ var (
 func init() {
 	Mount(http.DefaultServeMux)
 
+	//goland:noinspection GoBoolExpressions
 	if anubis.Version != "devel" {
 		URL = filepath.Join(filepath.Dir(URL), "xess.min.css")
 	}
@@ -31,6 +30,9 @@ func init() {
 	URL = URL + "?cachebuster=" + anubis.Version
 }
 
+// Mount registers the xess static file handlers on the given mux
 func Mount(mux *http.ServeMux) {
-	mux.Handle("/.within.website/x/xess/", internal.UnchangingCache(http.StripPrefix("/.within.website/x/xess/", http.FileServerFS(Static))))
+	prefix := anubis.BasePrefix + "/.within.website/x/xess/"
+
+	mux.Handle(prefix, internal.UnchangingCache(http.StripPrefix(prefix, http.FileServerFS(Static))))
 }

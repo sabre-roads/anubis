@@ -2,24 +2,30 @@ package web
 
 import (
 	"github.com/a-h/templ"
+
+	"github.com/TecharoHQ/anubis/lib/challenge"
+	"github.com/TecharoHQ/anubis/lib/localization"
+	"github.com/TecharoHQ/anubis/lib/policy/config"
 )
 
-func Base(title string, body templ.Component) templ.Component {
-	return base(title, body, nil)
+func Base(title string, body templ.Component, impressum *config.Impressum, localizer *localization.SimpleLocalizer) templ.Component {
+	return base(title, body, impressum, nil, nil, localizer)
 }
 
-func BaseWithOGTags(title string, body templ.Component, ogTags map[string]string) templ.Component {
-	return base(title, body, ogTags)
+func BaseWithChallengeAndOGTags(title string, body templ.Component, impressum *config.Impressum, challenge *challenge.Challenge, rules *config.ChallengeRules, ogTags map[string]string, localizer *localization.SimpleLocalizer) templ.Component {
+	return base(title, body, impressum, struct {
+		Rules     *config.ChallengeRules `json:"rules"`
+		Challenge any                    `json:"challenge"`
+	}{
+		Challenge: challenge,
+		Rules:     rules,
+	}, ogTags, localizer)
 }
 
-func Index() templ.Component {
-	return index()
+func ErrorPage(msg, mail string, localizer *localization.SimpleLocalizer) templ.Component {
+	return errorPage(msg, mail, localizer)
 }
 
-func ErrorPage(msg string, mail string) templ.Component {
-	return errorPage(msg, mail)
-}
-
-func Bench() templ.Component {
-	return bench()
+func Bench(localizer *localization.SimpleLocalizer) templ.Component {
+	return bench(localizer)
 }

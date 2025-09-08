@@ -1,11 +1,4 @@
-import processFast from "./proof-of-work.mjs";
-import processSlow from "./proof-of-work-slow.mjs";
-import { testVideo } from "./video.mjs";
-
-const algorithms = {
-  "fast": processFast,
-  "slow": processSlow,
-};
+import algorithms from "./algorithms/index.mjs";
 
 // from Xeact
 const u = (url = "", params = {}) => {
@@ -14,74 +7,101 @@ const u = (url = "", params = {}) => {
   return result.toString();
 };
 
-const imageURL = (mood, cacheBuster) =>
-  u(`/.within.website/x/cmd/anubis/static/img/${mood}.webp`, { cacheBuster });
-
-const dependencies = [
-  {
-    name: "WebCrypto",
-    msg: "Your browser doesn't have a functioning web.crypto element. Are you viewing this over a secure context?",
-    value: window.crypto,
-  },
-  {
-    name: "Web Workers",
-    msg: "Your browser doesn't support web workers (Anubis uses this to avoid freezing your browser). Do you have a plugin like JShelter installed?",
-    value: window.Worker,
-  },
-];
-
-function showContinueBar(hash, nonce, t0, t1) {
-  const barContainer = document.createElement("div");
-  barContainer.style.marginTop = "1rem";
-  barContainer.style.width = "100%";
-  barContainer.style.maxWidth = "32rem";
-  barContainer.style.background = "#3c3836";
-  barContainer.style.borderRadius = "4px";
-  barContainer.style.overflow = "hidden";
-  barContainer.style.cursor = "pointer";
-  barContainer.style.height = "2rem";
-  barContainer.style.marginLeft = "auto";
-  barContainer.style.marginRight = "auto";
-  barContainer.title = "Click to continue";
-
-  const barInner = document.createElement("div");
-  barInner.className = "bar-inner";
-  barInner.style.display = "flex";
-  barInner.style.alignItems = "center";
-  barInner.style.justifyContent = "center";
-  barInner.style.color = "white";
-  barInner.style.fontWeight = "bold";
-  barInner.style.height = "100%";
-  barInner.style.width = "0";
-  barInner.innerText = "I've finished reading, continue →";
-
-  barContainer.appendChild(barInner);
-  document.body.appendChild(barContainer);
-
-  requestAnimationFrame(() => {
-    barInner.style.width = "100%";
+const imageURL = (mood, cacheBuster, basePrefix) =>
+  u(`${basePrefix}/.within.website/x/cmd/anubis/static/img/${mood}.webp`, {
+    cacheBuster,
   });
 
-  barContainer.onclick = () => {
-    const redir = window.location.href;
-    window.location.replace(
-      u("/.within.website/x/cmd/anubis/api/pass-challenge", {
-        response: hash,
-        nonce,
-        redir,
-        elapsedTime: t1 - t0
-      })
-    );
-  };
+// Detect available languages by loading the manifest
+const getAvailableLanguages = async () => {
+  const basePrefix = JSON.parse(
+    document.getElementById("anubis_base_prefix").textContent,
+  );
+
+  try {
+    const response = await fetch(`${basePrefix}/.within.website/x/cmd/anubis/static/locales/manifest.json`);
+    if (response.ok) {
+      const manifest = await response.json();
+      return manifest.supportedLanguages || ['en'];
+    }
+  } catch (error) {
+    console.warn('Failed to load language manifest, falling back to default languages');
+  }
+
+  // Fallback to default languages if manifest loading fails
+  return ['en'];
+};
+
+// Use the browser language from the HTML lang attribute which is set by the server settings or request headers
+const getBrowserLanguage = async () =>
+  document.documentElement.lang;
+
+// Load translations from JSON files
+const loadTranslations = async (lang) => {
+  const basePrefix = JSON.parse(
+    document.getElementById("anubis_base_prefix").textContent,
+  );
+  try {
+    const response = await fetch(`${basePrefix}/.within.website/x/cmd/anubis/static/locales/${lang}.json`);
+    return await response.json();
+  } catch (error) {
+    console.warn(`Failed to load translations for ${lang}, falling back to English`);
+    if (lang !== 'en') {
+      return await loadTranslations('en');
+    }
+    throw error;
+  }
+};
+
+const getRedirectUrl = () => {
+  const publicUrl = JSON.parse(
+    document.getElementById("anubis_public_url").textContent,
+  );
+  if (publicUrl && window.location.href.startsWith(publicUrl)) {
+    const urlParams = new URLSearchParams(window.location.search);
+    return urlParams.get('redir');
+  }
+  return window.location.href;
 }
 
+let translations = {};
+let currentLang;
+
+// Initialize translations
+const initTranslations = async () => {
+  currentLang = await getBrowserLanguage();
+  translations = await loadTranslations(currentLang);
+};
+
+const t = (key) => translations[`js_${key}`] || translations[key] || key;
+
 (async () => {
-  const status = document.getElementById('status');
-  const image = document.getElementById('image');
-  const title = document.getElementById('title');
-  const progress = document.getElementById('progress');
-  const anubisVersion = JSON.parse(document.getElementById('anubis_version').textContent);
-  const details = document.querySelector('details');
+  // Initialize translations first
+  await initTranslations();
+
+  const dependencies = [
+    {
+      name: "Web Workers",
+      msg: t('web_workers_error'),
+      value: window.Worker,
+    },
+    {
+      name: "Cookies",
+      msg: t('cookies_error'),
+      value: navigator.cookieEnabled,
+    },
+  ];
+  const status = document.getElementById("status");
+  const image = document.getElementById("image");
+  const title = document.getElementById("title");
+  const progress = document.getElementById("progress");
+  const anubisVersion = JSON.parse(
+    document.getElementById("anubis_version").textContent,
+  );
+  const basePrefix = JSON.parse(
+    document.getElementById("anubis_base_prefix").textContent,
+  );
+  const details = document.querySelector("details");
   let userReadDetails = false;
 
   if (details) {
@@ -99,71 +119,40 @@ function showContinueBar(hash, nonce, t0, t1) {
     progress.style.display = "none";
   };
 
-  if (!window.isSecureContext) {
-    ohNoes({
-      titleMsg: "Your context is not secure!",
-      statusMsg: `Try connecting over HTTPS or let the admin know to set up HTTPS. For more information, see <a href="https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts#when_is_a_context_considered_secure">MDN</a>.`,
-      imageSrc: imageURL("reject", anubisVersion),
-    });
-    return;
-  }
-
-  // const testarea = document.getElementById('testarea');
-
-  // const videoWorks = await testVideo(testarea);
-  // console.log(`videoWorks: ${videoWorks}`);
-
-  // if (!videoWorks) {
-  //   title.innerHTML = "Oh no!";
-  //   status.innerHTML = "Checks failed. Please check your browser's settings and try again.";
-  //   image.src = imageURL("reject");
-  //   progress.style.display = "none";
-  //   return;
-  // }
-
-  status.innerHTML = 'Calculating...';
+  status.innerHTML = t('calculating');
 
   for (const { value, name, msg } of dependencies) {
     if (!value) {
       ohNoes({
-        titleMsg: `Missing feature ${name}`,
+        titleMsg: `${t('missing_feature')} ${name}`,
         statusMsg: msg,
-        imageSrc: imageURL("reject", anubisVersion),
+        imageSrc: imageURL("reject", anubisVersion, basePrefix),
       });
+      return;
     }
   }
 
-  const { challenge, rules } = await fetch("/.within.website/x/cmd/anubis/api/make-challenge", { method: "POST" })
-    .then(r => {
-      if (!r.ok) throw new Error("Failed to fetch config");
-      return r.json();
-    })
-    .catch(err => {
-      ohNoes({
-        titleMsg: "Internal error!",
-        statusMsg: `Failed to fetch challenge config: ${err.message}`,
-        imageSrc: imageURL("reject", anubisVersion),
-      });
-      throw err;
-    });
+  const { challenge, rules } = JSON.parse(
+    document.getElementById("anubis_challenge").textContent,
+  );
 
   const process = algorithms[rules.algorithm];
   if (!process) {
     ohNoes({
-      titleMsg: "Challenge error!",
-      statusMsg: `Failed to resolve check algorithm. You may want to reload the page.`,
-      imageSrc: imageURL("reject", anubisVersion),
+      titleMsg: t('challenge_error'),
+      statusMsg: t('challenge_error_msg'),
+      imageSrc: imageURL("reject", anubisVersion, basePrefix),
     });
     return;
   }
 
-  status.innerHTML = `Calculating...<br/>Difficulty: ${rules.report_as}, `;
+  status.innerHTML = `${t('calculating_difficulty')} ${rules.report_as}, `;
   progress.style.display = "inline-block";
 
   // the whole text, including "Speed:", as a single node, because some browsers
   // (Firefox mobile) present screen readers with each node as a separate piece
   // of text.
-  const rateText = document.createTextNode("Speed: 0kH/s");
+  const rateText = document.createTextNode(`${t('speed')} 0kH/s`);
   status.appendChild(rateText);
 
   let lastSpeedUpdate = 0;
@@ -173,7 +162,8 @@ function showContinueBar(hash, nonce, t0, t1) {
   try {
     const t0 = Date.now();
     const { hash, nonce } = await process(
-      challenge,
+      { basePrefix, version: anubisVersion },
+      challenge.randomData,
       rules.difficulty,
       null,
       (iters) => {
@@ -181,7 +171,7 @@ function showContinueBar(hash, nonce, t0, t1) {
         // only update the speed every second so it's less visually distracting
         if (delta - lastSpeedUpdate > 1000) {
           lastSpeedUpdate = delta;
-          rateText.data = `Speed: ${(iters / delta).toFixed(3)}kH/s`;
+          rateText.data = `${t('speed')} ${(iters / delta).toFixed(3)}kH/s`;
         }
         // the probability of still being on the page is (1 - likelihood) ^ iters.
         // by definition, half of the time the progress bar only gets to half, so
@@ -197,9 +187,7 @@ function showContinueBar(hash, nonce, t0, t1) {
         if (probability < 0.1 && !showingApology) {
           status.append(
             document.createElement("br"),
-            document.createTextNode(
-              "Verification is taking longer than expected. Please do not refresh the page.",
-            ),
+            document.createTextNode(t('verification_longer')),
           );
           showingApology = true;
         }
@@ -207,11 +195,6 @@ function showContinueBar(hash, nonce, t0, t1) {
     );
     const t1 = Date.now();
     console.log({ hash, nonce });
-
-    title.innerHTML = "Success!";
-    status.innerHTML = `Done! Took ${t1 - t0}ms, ${nonce} iterations`;
-    image.src = imageURL("happy", anubisVersion);
-    progress.style.display = "none";
 
     if (userReadDetails) {
       const container = document.getElementById("progress");
@@ -230,42 +213,40 @@ function showContinueBar(hash, nonce, t0, t1) {
       container.style.outlineOffset = "2px";
       container.style.width = "min(20rem, 90%)";
       container.style.margin = "1rem auto 2rem";
-      container.innerHTML = "I've finished reading, continue →";
+      container.innerHTML = t('finished_reading');
 
       function onDetailsExpand() {
-        const redir = window.location.href;
+        const redir = getRedirectUrl();
         window.location.replace(
-          u("/.within.website/x/cmd/anubis/api/pass-challenge", {
+          u(`${basePrefix}/.within.website/x/cmd/anubis/api/pass-challenge`, {
+            id: challenge.id,
             response: hash,
             nonce,
             redir,
-            elapsedTime: t1 - t0
+            elapsedTime: t1 - t0,
           }),
         );
       }
 
       container.onclick = onDetailsExpand;
       setTimeout(onDetailsExpand, 30000);
-
     } else {
-      setTimeout(() => {
-        const redir = window.location.href;
-        window.location.replace(
-          u("/.within.website/x/cmd/anubis/api/pass-challenge", {
-            response: hash,
-            nonce,
-            redir,
-            elapsedTime: t1 - t0
-          }),
-        );
-      }, 250);
+      const redir = getRedirectUrl();
+      window.location.replace(
+        u(`${basePrefix}/.within.website/x/cmd/anubis/api/pass-challenge`, {
+          id: challenge.id,
+          response: hash,
+          nonce,
+          redir,
+          elapsedTime: t1 - t0,
+        }),
+      );
     }
-
   } catch (err) {
     ohNoes({
-      titleMsg: "Calculation error!",
-      statusMsg: `Failed to calculate challenge: ${err.message}`,
-      imageSrc: imageURL("reject", anubisVersion),
+      titleMsg: t('calculation_error'),
+      statusMsg: `${t('calculation_error_msg')} ${err.message}`,
+      imageSrc: imageURL("reject", anubisVersion, basePrefix),
     });
   }
 })();
