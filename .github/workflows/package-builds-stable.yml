@@ -1,9 +1,8 @@
 name: Package builds (stable)
 
 on:
-  workflow_dispatch:
-  # release:
-  #   types: [published]
+ release:
+   types: [published]
 
 permissions:
   contents: write
