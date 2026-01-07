@@ -4,11 +4,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/TecharoHQ/anubis/lib/challenge"
+	"github.com/TecharoHQ/anubis/lib/config"
 	"github.com/TecharoHQ/anubis/lib/policy"
-	"github.com/TecharoHQ/anubis/lib/policy/config"
 )
 
 func mkRequest(t *testing.T, values map[string]string) *http.Request {
@@ -35,7 +36,6 @@ func TestBasic(t *testing.T) {
 		Challenge: &config.ChallengeRules{
 			Algorithm:  "fast",
 			Difficulty: 0,
-			ReportAs:   0,
 		},
 	}
 	const challengeStr = "hunter"
@@ -133,7 +133,7 @@ func TestBasic(t *testing.T) {
 				},
 			}
 
-			if _, err := i.Issue(cs.req, lg, inp); err != nil {
+			if _, err := i.Issue(httptest.NewRecorder(), cs.req, lg, inp); err != nil {
 				t.Errorf("can't issue challenge: %v", err)
 			}
 
