@@ -114,6 +114,7 @@ tarball.build({
 });
 
 // Build MSI installers from the Windows zips that were just built.
+/*
 packages
   .flat()
   .filter((pkg) => pkg.includes("windows"))
@@ -122,3 +123,4 @@ packages
     const msiPath = zip.replace(/\.zip$/, ".msi");
     $`go run ./internal/cmd/mkmsi --zip ${zip} --out ${msiPath}`;
   });
+*/
