@@ -15,6 +15,12 @@ import (
 //go:embed locales/*.json
 var localeFS embed.FS
 
+// manifestFile lists the supported languages. It is metadata, not a translation
+// catalog: go-i18n derives a locale from the file name, and "manifest" registers
+// under language.Und, which then shadows the English fallback for requests that
+// ask for "und".
+const manifestFile = "manifest.json"
+
 type LocalizationService struct {
 	bundle *i18n.Bundle
 }
@@ -39,7 +45,7 @@ func NewLocalizationService() *LocalizationService {
 
 		loadedAny := false
 		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") && entry.Name() != manifestFile {
 				filePath := "locales/" + entry.Name()
 				_, err := bundle.LoadMessageFileFS(localeFS, filePath)
 				if err != nil {
@@ -81,7 +87,28 @@ func (ls *LocalizationService) GetLocalizerFromRequest(r *http.Request) *i18n.Lo
 		return i18n.NewLocalizer(bundle, "en")
 	}
 	acceptLanguage := r.Header.Get("Accept-Language")
-	return i18n.NewLocalizer(ls.bundle, acceptLanguage, "en")
+
+	// Parse Accept-Language header to properly handle quality factors
+	// The language.ParseAcceptLanguage function returns tags sorted by quality
+	tags, _, err := language.ParseAcceptLanguage(acceptLanguage)
+	if err != nil || len(tags) == 0 {
+		return i18n.NewLocalizer(ls.bundle, "en")
+	}
+
+	// Convert parsed tags to strings for the localizer
+	// We include both the full tag and base language to ensure proper matching
+	langs := make([]string, 0, len(tags)*2+1)
+	for _, tag := range tags {
+		langs = append(langs, tag.String())
+		// Also add base language (e.g., "en" for "en-GB") to help matching
+		base, _ := tag.Base()
+		if base.String() != tag.String() {
+			langs = append(langs, base.String())
+		}
+	}
+	langs = append(langs, "en") // Always include English as fallback
+
+	return i18n.NewLocalizer(ls.bundle, langs...)
 }
 
 // SimpleLocalizer wraps i18n.Localizer with a more convenient API

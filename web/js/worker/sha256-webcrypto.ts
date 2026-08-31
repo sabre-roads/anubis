@@ -1,15 +1,20 @@
+import { WorkerArgs } from "@lib/worker";
+
 const encoder = new TextEncoder();
 
-const calculateSHA256 = async (input: string) => {
+const calculateSHA256 = async (input: string): Promise<ArrayBuffer> => {
   const data = encoder.encode(input);
   return await crypto.subtle.digest("SHA-256", data);
 };
 
 const toHexString = (byteArray: Uint8Array) => {
-  return byteArray.reduce((str, byte) => str + byte.toString(16).padStart(2, "0"), "");
+  return byteArray.reduce(
+    (str, byte) => str + byte.toString(16).padStart(2, "0"),
+    "",
+  );
 };
 
-addEventListener("message", async ({ data: eventData }) => {
+addEventListener("message", async ({ data: eventData }: { data: WorkerArgs }) => {
   const { data, difficulty, threads } = eventData;
   let nonce = eventData.nonce;
   const isMainThread = nonce === 0;
@@ -31,7 +36,7 @@ addEventListener("message", async ({ data: eventData }) => {
     }
 
     if (isValid && isDifficultyOdd) {
-      if ((hashArray[requiredZeroBytes] >> 4) !== 0) {
+      if (hashArray[requiredZeroBytes] >> 4 !== 0) {
         isValid = false;
       }
     }
@@ -52,7 +57,7 @@ addEventListener("message", async ({ data: eventData }) => {
 
     /* Truncate the decimal portion of the nonce. This is a bit of an evil bit
      * hack, but it works reliably enough. The core of why this works is:
-     * 
+     *
      * > 13.4 % 1 !== 0
      * true
      * > 13 % 1 !== 0

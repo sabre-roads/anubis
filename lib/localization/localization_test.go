@@ -3,6 +3,7 @@ package localization
 import (
 	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"sort"
 	"testing"
 
@@ -13,25 +14,28 @@ func TestLocalizationService(t *testing.T) {
 	service := NewLocalizationService()
 
 	loadingStrMap := map[string]string{
-		"de":    "Ladevorgang...",
+		"de":    "Wird geladen …",
 		"en":    "Loading...",
 		"es":    "Cargando...",
 		"et":    "Laadin...",
 		"fil":   "Naglo-load...",
 		"fr":    "Chargement...",
 		"ja":    "ロード中...",
+		"hr":    "Učitavanje...",
 		"is":    "Hleður...",
 		"nb":    "Laster inn...",
 		"nl":    "Laden...",
 		"nn":    "Lastar inn...",
+		"pl":    "Ładowanie...",
 		"pt-BR": "Carregando...",
 		"tr":    "Yükleniyor...",
 		"ru":    "Загрузка...",
 		"uk":    "Завантаження...",
-		"vi":    "Đang nạp...",
+		"vi":    "Đang tải...",
 		"zh-CN": "加载中...",
 		"zh-TW": "載入中...",
 		"sv":    "Laddar...",
+		"bg":    "Зареждане...",
 	}
 
 	var keys []string
@@ -83,7 +87,7 @@ func loadManifest(t *testing.T) manifest {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fin.Close()
+	defer fin.Close() //nolint:errcheck
 
 	var result manifest
 	if err := json.NewDecoder(fin).Decode(&result); err != nil {
@@ -101,7 +105,7 @@ func TestComprehensiveTranslations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fin.Close()
+	defer fin.Close() //nolint:errcheck
 
 	if err := json.NewDecoder(fin).Decode(&translations); err != nil {
 		t.Fatal(err)
@@ -133,6 +137,77 @@ func TestComprehensiveTranslations(t *testing.T) {
 						t.Error("key not defined")
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestAcceptLanguageQualityFactors(t *testing.T) {
+	service := NewLocalizationService()
+
+	testCases := []struct {
+		name           string
+		acceptLanguage string
+		expectedLang   string
+	}{
+		{"simple_en", "en", "en"},
+		{"simple_de", "de", "de"},
+		{"en_GB_with_lower_priority_de", "en-GB,de-DE;q=0.5", "en"},
+		{"en_GB_only", "en-GB", "en"},
+		{"de_with_lower_priority_en", "de,en;q=0.5", "de"},
+		{"de_DE_with_lower_priority_en", "de-DE,en;q=0.5", "de"},
+		{"fr_with_lower_priority_de", "fr,de;q=0.5", "fr"},
+		{"zh_CN_regional", "zh-CN", "zh-CN"},
+		{"zh_TW_regional", "zh-TW", "zh-TW"},
+		{"pt_BR_regional", "pt-BR", "pt-BR"},
+		{"complex_header", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7,de;q=0.5", "fr"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Header.Set("Accept-Language", tc.acceptLanguage)
+
+			localizer := service.GetLocalizerFromRequest(req)
+			sl := &SimpleLocalizer{Localizer: localizer}
+
+			gotLang := sl.GetLang()
+			if gotLang != tc.expectedLang {
+				t.Errorf("Accept-Language %q: expected %s, got %s", tc.acceptLanguage, tc.expectedLang, gotLang)
+			}
+		})
+	}
+}
+
+func TestAcceptLanguageUndetermined(t *testing.T) {
+	service := NewLocalizationService()
+
+	testCases := []struct {
+		name           string
+		acceptLanguage string
+		expectedLang   string
+	}{
+		{"undetermined", "und", "en"},
+		{"undetermined_with_quality", "und;q=0.9", "en"},
+		{"undetermined_below_german", "de,und;q=0.9", "de"},
+		{"unknown_subtag", "xx", "en"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Header.Set("Accept-Language", tc.acceptLanguage)
+
+			sl := &SimpleLocalizer{Localizer: service.GetLocalizerFromRequest(req)}
+
+			// T uses MustLocalize, so an unresolved message panics and serving the
+			// challenge page fails. GetLang alone cannot catch that: it swallows the
+			// lookup error and reports "en" either way.
+			if got := sl.T("making_sure_not_bot"); got == "" {
+				t.Errorf("Accept-Language %q: empty translation", tc.acceptLanguage)
+			}
+			if got := sl.GetLang(); got != tc.expectedLang {
+				t.Errorf("Accept-Language %q: expected %s, got %s", tc.acceptLanguage, tc.expectedLang, got)
 			}
 		})
 	}
